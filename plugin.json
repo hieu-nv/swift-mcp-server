@@ -1,0 +1,31 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "swift-mcp-server",
+  "displayName": "Swift SourceKit-LSP",
+  "version": "2.0.0",
+  "description": "Semantic Swift, Objective-C, and Apple SDK intelligence via SourceKit-LSP: navigation, refactoring, diagnostics, and OS availability checks.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Find symbols and compiler diagnostics in my Swift files",
+    "Check which minimum iOS version this Swift file compiles for",
+    "Trace callers and protocol conformers across this Swift package"
+  ],
+  "author": {
+    "name": "Swift MCP Server",
+    "url": "https://github.com/anvyxhq/swift-mcp-server"
+  },
+  "homepage": "https://github.com/anvyxhq/swift-mcp-server",
+  "repository": "https://github.com/anvyxhq/swift-mcp-server",
+  "license": "MIT",
+  "keywords": [
+    "swift",
+    "sourcekit-lsp",
+    "ios",
+    "macos",
+    "xcode",
+    "swiftpm",
+    "mcp",
+    "refactoring",
+    "availability"
+  ]
+}

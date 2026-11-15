@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" fill="none">
+  <defs>
+    <linearGradient id="swift-bg" x1="32" y1="28" x2="224" y2="228" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FF7A2F" />
+      <stop offset="100%" stop-color="#E83E1B" />
+    </linearGradient>
+    <linearGradient id="swift-wing" x1="76" y1="68" x2="196" y2="188" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="100%" stop-color="#FFE6DB" />
+    </linearGradient>
+  </defs>
+  <!-- ~10% transparent padding around badge for clean framing on light and dark themes -->
+  <rect x="26" y="26" width="204" height="204" rx="44" fill="url(#swift-bg)" />
+  <rect x="27.5" y="27.5" width="201" height="201" rx="42.5" stroke="#FFFFFF" stroke-opacity="0.22" stroke-width="3" />
+  <!-- Geometric Swift-inspired wing + semantic angle brackets -->
+  <path
+    d="M178 156c8-24-2-55-26-76 9 19 8 38-2 52-18-13-39-29-56-47 10 21 26 40 44 54-17-4-34-12-50-24 14 21 35 37 59 44-16 11-39 14-62 5 22 22 57 30 88 18 11-4 20 0 27 9-1-13-7-25-22-35Z"
+    fill="url(#swift-wing)"
+  />
+  <!-- Subtle semantic code chevrons in upper-left -->
+  <path
+    d="M78 72l-16 14 16 14"
+    stroke="#FFFFFF"
+    stroke-opacity="0.9"
+    stroke-width="8"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

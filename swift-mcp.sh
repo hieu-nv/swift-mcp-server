@@ -69,7 +69,7 @@ fix_permissions() {
     print_info "Fixing file permissions..."
     
     # Fix script permissions
-    chmod +x *.sh 2>/dev/null || true
+    chmod +x *.sh scripts/*.sh 2>/dev/null || true
     
     # Fix binary permissions
     if [ -f "$SERVER_BINARY" ]; then
@@ -109,6 +109,25 @@ EOF
     
     print_success "VS Code MCP configuration created"
     print_info "Config file: $VSCODE_SETTINGS_DIR/mcp-swift-server.json"
+}
+
+bundle_plugin() {
+    print_info "Bundling Antigravity plugin..."
+    "$SCRIPT_DIR/scripts/bundle-plugin.sh" "$@"
+}
+
+setup_antigravity() {
+    print_info "Installing Swift MCP Server as an Antigravity plugin..."
+
+    if ! command -v agy &> /dev/null; then
+        print_error "agy CLI not found. Install Google Antigravity CLI or use ./swift-mcp.sh bundle"
+        return 1
+    fi
+
+    local bundle_dir="$SCRIPT_DIR/.build/antigravity-plugin"
+    bundle_plugin "$bundle_dir"
+    agy plugin install "$bundle_dir"
+    print_success "Antigravity plugin installed"
 }
 
 health_check() {
@@ -238,12 +257,14 @@ setup_all() {
     print_info "  $0 stdio"
     print_info ""
     print_info "Available commands:"
-    print_info "  $0 setup    - Full setup (default)"
-    print_info "  $0 build    - Build server only"
-    print_info "  $0 test     - Test functionality"
-    print_info "  $0 stdio    - Run persistent STDIO mode"
-    print_info "  $0 health   - Health check"
-    print_info "  $0 vscode   - Setup VS Code only"
+    print_info "  $0 setup       - Full setup (default)"
+    print_info "  $0 build       - Build server only"
+    print_info "  $0 test        - Test functionality"
+    print_info "  $0 stdio       - Run persistent STDIO mode"
+    print_info "  $0 health      - Health check"
+    print_info "  $0 vscode      - Setup VS Code only"
+    print_info "  $0 bundle      - Stage prebuilt Antigravity plugin bundle"
+    print_info "  $0 antigravity - Install Antigravity plugin via agy"
 }
 
 show_help() {
@@ -253,13 +274,15 @@ Swift MCP Server - All-in-One Management Script
 Usage: $0 [command]
 
 Commands:
-  setup      Full setup (build, configure, test) - DEFAULT
-  build      Build server binary only
-  test       Test server functionality
-  stdio      Run persistent STDIO mode (won't shutdown)
-  health     Run health check
-  vscode     Setup VS Code MCP configuration
-  help       Show this help message
+  setup        Full setup (build, configure, test) - DEFAULT
+  build        Build server binary only
+  test         Test server functionality
+  stdio        Run persistent STDIO mode (won't shutdown)
+  health       Run health check
+  vscode       Setup VS Code MCP configuration
+  bundle       Build release binary and stage an Antigravity plugin bundle
+  antigravity  Build, stage, and install the Antigravity plugin via agy
+  help         Show this help message
 
 Examples:
   $0                    # Full setup (default)
@@ -298,6 +321,15 @@ case "${1:-setup}" in
     "vscode")
         print_header
         setup_vscode
+        ;;
+    "bundle")
+        print_header
+        shift || true
+        bundle_plugin "$@"
+        ;;
+    "antigravity")
+        print_header
+        setup_antigravity
         ;;
     "help"|*)
         show_help

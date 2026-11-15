@@ -12,7 +12,7 @@ public final class MCPServer: @unchecked Sendable {
     private let group: EventLoopGroup
     private var channel: Channel?
 
-    private let swiftLanguageServer: SwiftLanguageServer
+    private let workspaceManager: WorkspaceSessionManager
     private let mcpProtocolHandler: MCPProtocolHandler
 
     public init(
@@ -26,9 +26,9 @@ public final class MCPServer: @unchecked Sendable {
         self.logger = logger
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
 
-        self.swiftLanguageServer = SwiftLanguageServer(logger: logger, workspaceRoot: workspaceRoot)
+        self.workspaceManager = WorkspaceSessionManager(logger: logger, workspaceRoot: workspaceRoot)
         self.mcpProtocolHandler = MCPProtocolHandler(
-            swiftLanguageServer: swiftLanguageServer,
+            workspaceManager: workspaceManager,
             logger: logger
         )
     }
@@ -63,10 +63,10 @@ public final class MCPServer: @unchecked Sendable {
         logger.info("Swift MCP Server started on \(host):\(port)")
         logger.info("Server is ready to handle MCP requests")
 
-        // Warm up SourceKit-LSP in the background so the first tool call does
-        // not pay the full startup and index-warmup latency.
+        // Warm up SourceKit-LSP in the background when a project workspace is known
+        // so the first tool call does not pay the full startup and index latency.
         Task { [weak self] in
-            try? await self?.swiftLanguageServer.initialize()
+            await self?.workspaceManager.warmUpDefaultIfApplicable()
         }
 
         // Wait until the server is closed
@@ -76,7 +76,7 @@ public final class MCPServer: @unchecked Sendable {
     public func stop() async throws {
         logger.info("Shutting down Swift MCP Server...")
 
-        await swiftLanguageServer.shutdown()
+        await workspaceManager.shutdownAll()
         try await channel?.close()
         try await group.shutdownGracefully()
 

@@ -85,6 +85,29 @@ Point any MCP client that speaks `stdio` at the built binary:
 
 This works with any local MCP client, including Claude Code / Claude Desktop and Cursor / VS Code style setups. A ready-to-use example lives in [`vscode-mcp-config.json`](vscode-mcp-config.json).
 
+### Antigravity Plugin
+
+This repository is also packaged as a self-contained [Google Antigravity](https://antigravity.google/docs/plugins) plugin (`plugin.json`, `mcp_config.json`, `scripts/run-mcp.sh`, `rules/`, `skills/`, and `assets/logo.svg`):
+
+```bash
+# Install directly from a local checkout
+agy plugin install /path/to/swift-mcp-server
+
+# Or build a prebuilt standalone bundle and install it (no first-run compile delay)
+./swift-mcp.sh antigravity
+
+# Validate plugin metadata and components
+agy plugin validate /path/to/swift-mcp-server
+```
+
+- **Bundled server & zero-config startup**: `mcp_config.json` launches `scripts/run-mcp.sh`, which uses a bundled release binary (`scripts/swift-mcp-server`, `bin/swift-mcp-server`, or an up-to-date `.build/release/swift-mcp-server`) if present, or automatically builds and caches the release binary inside `${PLUGIN_DATA}` on first run without writing to the read-only plugin directory.
+- **Automatic workspace detection**: When started without `--workspace` (as in Antigravity), the server detects each SwiftPM/Xcode/C-family project root from MCP `initialize` hints or the `file_path` passed to tool calls and manages SourceKit-LSP sessions per project.
+- **Included components**:
+  - **MCP server** (`swift-mcp-server`): All 15 SourceKit-LSP and Apple SDK availability tools over `stdio`.
+  - **Rules** (`rules/swift-mcp-server.md`): Glob-scoped guidance for `.swift`, `Package.swift`, Xcode projects, and Objective-C/C headers.
+  - **Skills**: `/swift-lsp` (semantic navigation, diagnostics, fix-its, and safe rename) and `/swift-availability` (OS deployment target checks and SDK availability lookup).
+- **Prebuilt distributable bundle**: Run `./swift-mcp.sh bundle [output-dir]` (or `scripts/bundle-plugin.sh`) to stage a prebuilt plugin folder with `scripts/swift-mcp-server` already compiled.
+
 ## Tools
 
 The navigation, inspection, structure and editing tools are backed by SourceKit-LSP; the availability tools use the compiler and SDKs of the active Xcode. Line and character arguments are **0-based**.

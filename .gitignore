@@ -59,6 +59,8 @@ secrets/
 *.o
 *.so
 *.dylib
+/bin/
+/scripts/swift-mcp-server
 
 # Runtime logs
 *.json.log

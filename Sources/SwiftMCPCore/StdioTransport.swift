@@ -6,10 +6,11 @@ import SourceKitLSP
 /// Compatible with VS Code MCP and Serena integration
 public final class StdioTransport: @unchecked Sendable {
     private let logger: Logger
-    private let swiftLanguageServer: SwiftLanguageServer
+    private let workspaceManager: WorkspaceSessionManager
     private let mcpProtocolHandler: MCPProtocolHandler
     private let shutdownLock = NSLock()
     private let stdoutLock = NSLock()
+    private let inFlightTasks = InFlightTaskTracker()
     private var hasShutdown = false
 
     public init(
@@ -17,9 +18,9 @@ public final class StdioTransport: @unchecked Sendable {
         workspaceRoot: URL? = nil
     ) {
         self.logger = logger
-        self.swiftLanguageServer = SwiftLanguageServer(logger: logger, workspaceRoot: workspaceRoot)
+        self.workspaceManager = WorkspaceSessionManager(logger: logger, workspaceRoot: workspaceRoot)
         self.mcpProtocolHandler = MCPProtocolHandler(
-            swiftLanguageServer: swiftLanguageServer,
+            workspaceManager: workspaceManager,
             logger: logger
         )
     }
@@ -28,10 +29,10 @@ public final class StdioTransport: @unchecked Sendable {
         logger.info("Swift MCP Server started with STDIO transport")
         logger.info("Server is ready to handle MCP requests via STDIO")
 
-        // Warm up SourceKit-LSP in the background so the first tool call does
-        // not pay the full startup and index-warmup latency.
+        // Warm up SourceKit-LSP in the background when a project workspace is known
+        // so the first tool call does not pay the full startup and index latency.
         Task { [weak self] in
-            try? await self?.swiftLanguageServer.initialize()
+            await self?.workspaceManager.warmUpDefaultIfApplicable()
         }
 
         while true {
@@ -49,7 +50,7 @@ public final class StdioTransport: @unchecked Sendable {
             // Handle each request in its own task so one slow SourceKit-LSP
             // call cannot block later requests or shutdown on stdin close.
             // Responses carry their request id, so they may complete out of order.
-            Task { [self] in
+            await inFlightTasks.launch { [self] in
                 do {
                     // Notifications (no `id`) return nil — they must not be answered.
                     if let response = try await processRequest(line) {
@@ -63,6 +64,7 @@ public final class StdioTransport: @unchecked Sendable {
             }
         }
 
+        await inFlightTasks.waitForAll()
         await shutdownIfNeeded(logMessage: "Shutting down Swift MCP Server (STDIO)...")
     }
 
@@ -157,7 +159,7 @@ public final class StdioTransport: @unchecked Sendable {
         }
 
         logger.info("\(logMessage)")
-        await swiftLanguageServer.shutdown()
+        await workspaceManager.shutdownAll()
         logger.info("Swift MCP Server (STDIO) stopped")
     }
 
@@ -176,6 +178,32 @@ public final class StdioTransport: @unchecked Sendable {
 
         hasShutdown = true
         return true
+    }
+}
+
+// MARK: - In-Flight Request Tracking
+
+private actor InFlightTaskTracker {
+    private var tasks: [UUID: Task<Void, Never>] = [:]
+
+    func launch(_ operation: @escaping @Sendable () async -> Void) {
+        let id = UUID()
+        let task = Task {
+            await operation()
+            self.remove(id)
+        }
+        tasks[id] = task
+    }
+
+    private func remove(_ id: UUID) {
+        tasks.removeValue(forKey: id)
+    }
+
+    func waitForAll() async {
+        while let (id, task) = tasks.first {
+            await task.value
+            tasks.removeValue(forKey: id)
+        }
     }
 }
 

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "swift-mcp-server": {
+      "command": "/bin/sh",
+      "args": [
+        "${PLUGIN_ROOT}/scripts/run-mcp.sh"
+      ],
+      "timeoutSeconds": 300
+    }
+  }
+}

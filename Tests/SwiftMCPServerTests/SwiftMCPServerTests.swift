@@ -508,6 +508,103 @@ final class SwiftMCPServerTests: XCTestCase {
         #endif
     }
 
+    func testWorkspaceManagerIgnoresNonProjectCurrentDirectory() async throws {
+        let logger = Logger(label: "test")
+        let pluginDir = try makeTemporaryPackage(named: "PluginBundle")
+        defer { try? FileManager.default.removeItem(at: pluginDir) }
+
+        let fromRoot = WorkspaceSessionManager(
+            logger: logger,
+            currentDirectoryURL: URL(fileURLWithPath: "/")
+        )
+        let rootActive = await fromRoot.activeWorkspaceRoot()
+        XCTAssertNil(rootActive)
+
+        let fromHome = WorkspaceSessionManager(
+            logger: logger,
+            currentDirectoryURL: FileManager.default.homeDirectoryForCurrentUser
+        )
+        let homeActive = await fromHome.activeWorkspaceRoot()
+        XCTAssertNil(homeActive)
+
+        let fromPlugin = WorkspaceSessionManager(
+            logger: logger,
+            currentDirectoryURL: pluginDir,
+            additionalExcludedPaths: [pluginDir.path]
+        )
+        let pluginActive = await fromPlugin.activeWorkspaceRoot()
+        XCTAssertNil(pluginActive)
+    }
+
+    func testWorkspaceManagerDiscoversAndRoutesSeparatePackages() async throws {
+        let logger = Logger(label: "test")
+        let packageOne = try makeTemporaryPackage(named: "PackageOne")
+        let packageTwo = try makeTemporaryPackage(named: "PackageTwo")
+        defer {
+            try? FileManager.default.removeItem(at: packageOne)
+            try? FileManager.default.removeItem(at: packageTwo)
+        }
+
+        let fileOne = packageOne.appendingPathComponent("Sources/PackageOne/One.swift")
+        let fileTwo = packageTwo.appendingPathComponent("Sources/PackageTwo/Two.swift")
+        try "struct One {}\n".write(to: fileOne, atomically: true, encoding: .utf8)
+        try "struct Two {}\n".write(to: fileTwo, atomically: true, encoding: .utf8)
+
+        let manager = WorkspaceSessionManager(
+            logger: logger,
+            currentDirectoryURL: FileManager.default.homeDirectoryForCurrentUser
+        )
+
+        let (serverOne, resolvedOne) = await manager.server(forFilePath: fileOne.path)
+        XCTAssertEqual(canonicalPath(serverOne.workspaceURL.path), canonicalPath(packageOne.path))
+        XCTAssertEqual(resolvedOne, fileOne.standardizedFileURL.path)
+
+        let (serverTwo, resolvedTwo) = await manager.server(forFilePath: fileTwo.path)
+        XCTAssertEqual(canonicalPath(serverTwo.workspaceURL.path), canonicalPath(packageTwo.path))
+        XCTAssertEqual(resolvedTwo, fileTwo.standardizedFileURL.path)
+        XCTAssertFalse(serverOne === serverTwo)
+
+        let active = await manager.activeWorkspaceRoot()
+        XCTAssertEqual(canonicalPath(active?.path), canonicalPath(packageTwo.path))
+    }
+
+    func testWorkspaceManagerInitializeHintSetsDefaultWorkspace() async throws {
+        let logger = Logger(label: "test")
+        let package = try makeTemporaryPackage(named: "HintWorkspace")
+        defer { try? FileManager.default.removeItem(at: package) }
+
+        let manager = WorkspaceSessionManager(
+            logger: logger,
+            currentDirectoryURL: FileManager.default.homeDirectoryForCurrentUser
+        )
+        let handler = MCPProtocolHandler(workspaceManager: manager, logger: logger)
+
+        let initRequest = MCPRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "initialize",
+            params: [
+                "protocolVersion": "2024-11-05",
+                "workspaceFolders": [
+                    [
+                        "uri": .string(package.absoluteString),
+                        "name": "HintWorkspace",
+                    ]
+                ],
+            ]
+        )
+
+        _ = try await handler.handleRequest(initRequest)
+        let active = await manager.activeWorkspaceRoot()
+        XCTAssertEqual(canonicalPath(active?.path), canonicalPath(package.path))
+
+        let resolved = await manager.resolvePath("Sources/HintWorkspace/File.swift")
+        XCTAssertEqual(
+            canonicalPath(resolved),
+            canonicalPath(package.appendingPathComponent("Sources/HintWorkspace/File.swift").path)
+        )
+    }
+
     // MARK: - Helpers
 
     private func sourceKitLSPAvailable() -> Bool {

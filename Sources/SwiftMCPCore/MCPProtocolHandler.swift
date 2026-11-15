@@ -4,18 +4,30 @@ import Logging
 import SourceKitLSP
 
 public final class MCPProtocolHandler {
-    private let swiftLanguageServer: SwiftLanguageServer
+    private let workspaceManager: WorkspaceSessionManager
     private let availabilityService: APIAvailabilityService
     private let logger: Logger
 
     public init(
+        workspaceManager: WorkspaceSessionManager,
+        availabilityService: APIAvailabilityService = APIAvailabilityService(),
+        logger: Logger
+    ) {
+        self.workspaceManager = workspaceManager
+        self.availabilityService = availabilityService
+        self.logger = logger
+    }
+
+    public convenience init(
         swiftLanguageServer: SwiftLanguageServer,
         availabilityService: APIAvailabilityService = APIAvailabilityService(),
         logger: Logger
     ) {
-        self.swiftLanguageServer = swiftLanguageServer
-        self.availabilityService = availabilityService
-        self.logger = logger
+        self.init(
+            workspaceManager: WorkspaceSessionManager(pinnedLanguageServer: swiftLanguageServer, logger: logger),
+            availabilityService: availabilityService,
+            logger: logger
+        )
     }
 
     public func handleRequest(_ request: MCPRequest) async throws -> MCPResponse {
@@ -40,6 +52,8 @@ public final class MCPProtocolHandler {
     // MARK: - Initialize
 
     private func handleInitialize(_ request: MCPRequest) async throws -> MCPResponse {
+        await workspaceManager.updateClientWorkspaceHint(from: request.params)
+
         let capabilities = ServerCapabilities(
             tools: ToolsCapability(listChanged: true),
             resources: ResourcesCapability(subscribe: true, listChanged: true)
@@ -186,7 +200,12 @@ public final class MCPProtocolHandler {
                         "query": [
                             "type": "string",
                             "description": "Symbol name or substring to search for",
-                        ]
+                        ],
+                        "workspace_path": [
+                            "type": "string",
+                            "description":
+                                "Optional. Workspace or file path identifying the Swift project when no file tool has run yet.",
+                        ],
                     ],
                     "required": ["query"],
                 ]
@@ -426,7 +445,8 @@ public final class MCPProtocolHandler {
             throw MCPError.invalidParams
         }
 
-        return try await swiftLanguageServer.findSymbols(in: filePath, namePattern: namePattern)
+        let (swiftLanguageServer, resolvedPath) = await workspaceManager.server(forFilePath: filePath)
+        return try await swiftLanguageServer.findSymbols(in: resolvedPath, namePattern: namePattern)
     }
 
     private func handleFindReferences(_ arguments: JSONObject) async throws -> [String] {
@@ -437,8 +457,9 @@ public final class MCPProtocolHandler {
             throw MCPError.invalidParams
         }
 
+        let (swiftLanguageServer, resolvedPath) = await workspaceManager.server(forFilePath: filePath)
         let position = Position(line: line, character: character)
-        let locations = try await swiftLanguageServer.findReferences(at: position, in: filePath)
+        let locations = try await swiftLanguageServer.findReferences(at: position, in: resolvedPath)
 
         return locations.map { "\($0.uri):\($0.line):\($0.character)" }
     }
@@ -451,8 +472,9 @@ public final class MCPProtocolHandler {
             throw MCPError.invalidParams
         }
 
+        let (swiftLanguageServer, resolvedPath) = await workspaceManager.server(forFilePath: filePath)
         let position = Position(line: line, character: character)
-        let locations = try await swiftLanguageServer.getDefinition(at: position, in: filePath)
+        let locations = try await swiftLanguageServer.getDefinition(at: position, in: resolvedPath)
 
         return locations.map { "\($0.targetUri):\($0.targetRange.start.line):\($0.targetRange.start.character)" }
     }
@@ -465,8 +487,9 @@ public final class MCPProtocolHandler {
             throw MCPError.invalidParams
         }
 
+        let (swiftLanguageServer, resolvedPath) = await workspaceManager.server(forFilePath: filePath)
         let position = Position(line: line, character: character)
-        let hover = try await swiftLanguageServer.getHover(at: position, in: filePath)
+        let hover = try await swiftLanguageServer.getHover(at: position, in: resolvedPath)
 
         if case .markupContent(let content) = hover?.contents {
             return content.value
@@ -482,7 +505,8 @@ public final class MCPProtocolHandler {
             throw MCPError.invalidParams
         }
 
-        let edits = try await swiftLanguageServer.formatDocument(at: filePath)
+        let (swiftLanguageServer, resolvedPath) = await workspaceManager.server(forFilePath: filePath)
+        let edits = try await swiftLanguageServer.formatDocument(at: resolvedPath)
         return edits.map { "Line \($0.range.start.line): \($0.newText)" }
     }
 
@@ -491,7 +515,8 @@ public final class MCPProtocolHandler {
             throw MCPError.invalidParams
         }
 
-        let diagnostics = try await swiftLanguageServer.getDiagnostics(for: filePath)
+        let (swiftLanguageServer, resolvedPath) = await workspaceManager.server(forFilePath: filePath)
+        let diagnostics = try await swiftLanguageServer.getDiagnostics(for: resolvedPath)
         return diagnostics.map {
             let severity = $0.severity.map { String(describing: $0).lowercased() } ?? "unknown"
             return "\($0.range.start.line):\($0.range.start.character) [\(severity)] \($0.message)"
@@ -503,6 +528,9 @@ public final class MCPProtocolHandler {
             throw MCPError.invalidParams
         }
 
+        let swiftLanguageServer = try await workspaceManager.serverForWorkspace(
+            explicitPath: arguments.string("workspace_path")
+        )
         return try await swiftLanguageServer.searchWorkspaceSymbols(query: query)
     }
 
@@ -515,8 +543,9 @@ public final class MCPProtocolHandler {
             throw MCPError.invalidParams
         }
 
+        let (swiftLanguageServer, resolvedPath) = await workspaceManager.server(forFilePath: filePath)
         let position = Position(line: line, character: character)
-        let edits = try await swiftLanguageServer.rename(at: position, in: filePath, newName: newName)
+        let edits = try await swiftLanguageServer.rename(at: position, in: resolvedPath, newName: newName)
 
         guard !edits.isEmpty else {
             return "No rename edits produced. The symbol may not be renameable, or the index is not ready yet."
@@ -535,9 +564,10 @@ public final class MCPProtocolHandler {
             throw MCPError.invalidParams
         }
 
+        let (swiftLanguageServer, resolvedPath) = await workspaceManager.server(forFilePath: filePath)
         let direction = CallHierarchyDirection(rawValue: arguments.string("direction") ?? "") ?? .incoming
         let position = Position(line: line, character: character)
-        return try await swiftLanguageServer.callHierarchy(at: position, in: filePath, direction: direction)
+        return try await swiftLanguageServer.callHierarchy(at: position, in: resolvedPath, direction: direction)
     }
 
     private func handleTypeHierarchy(_ arguments: JSONObject) async throws -> [SymbolInfo] {
@@ -548,9 +578,10 @@ public final class MCPProtocolHandler {
             throw MCPError.invalidParams
         }
 
+        let (swiftLanguageServer, resolvedPath) = await workspaceManager.server(forFilePath: filePath)
         let direction = TypeHierarchyDirection(rawValue: arguments.string("direction") ?? "") ?? .subtypes
         let position = Position(line: line, character: character)
-        return try await swiftLanguageServer.typeHierarchy(at: position, in: filePath, direction: direction)
+        return try await swiftLanguageServer.typeHierarchy(at: position, in: resolvedPath, direction: direction)
     }
 
     private func handleGetImplementations(_ arguments: JSONObject) async throws -> [String] {
@@ -561,8 +592,9 @@ public final class MCPProtocolHandler {
             throw MCPError.invalidParams
         }
 
+        let (swiftLanguageServer, resolvedPath) = await workspaceManager.server(forFilePath: filePath)
         let position = Position(line: line, character: character)
-        let locations = try await swiftLanguageServer.getImplementations(at: position, in: filePath)
+        let locations = try await swiftLanguageServer.getImplementations(at: position, in: resolvedPath)
         return locations.map { "\($0.targetUri):\($0.targetRange.start.line):\($0.targetRange.start.character)" }
     }
 
@@ -573,8 +605,10 @@ public final class MCPProtocolHandler {
             throw MCPError.invalidParams
         }
 
+        let (swiftLanguageServer, resolvedPath) = await workspaceManager.server(forFilePath: filePath)
+
         if let apply = arguments.string("apply") {
-            let edits = try await swiftLanguageServer.applyCodeAction(titled: apply, atLine: line, in: filePath)
+            let edits = try await swiftLanguageServer.applyCodeAction(titled: apply, atLine: line, in: resolvedPath)
 
             guard !edits.isEmpty else {
                 return "No applicable code action titled '\(apply)' at line \(line)."
@@ -585,7 +619,7 @@ public final class MCPProtocolHandler {
             return "Applied '\(apply)': \(totalEdits) edits across \(edits.count) file(s)\n\(detail)"
         }
 
-        let actions = try await swiftLanguageServer.codeActions(atLine: line, in: filePath)
+        let actions = try await swiftLanguageServer.codeActions(atLine: line, in: resolvedPath)
 
         guard !actions.isEmpty else {
             return "No code actions available at line \(line)."
@@ -605,11 +639,13 @@ public final class MCPProtocolHandler {
             throw MCPError.invalidParams
         }
 
+        let resolvedPath = await workspaceManager.resolvePath(filePath)
+        let moduleFiles = await resolveModuleFiles(stringArray(arguments.array("module_files")))
         let report = try await availabilityService.check(
-            filePath: filePath,
+            filePath: resolvedPath,
             minimumVersion: minimumVersion,
             platform: try platformArgument(arguments),
-            moduleFiles: stringArray(arguments.array("module_files"))
+            moduleFiles: moduleFiles
         )
         return report.summary
     }
@@ -622,11 +658,13 @@ public final class MCPProtocolHandler {
             throw MCPError.invalidParams
         }
 
+        let resolvedPath = await workspaceManager.resolvePath(filePath)
+        let moduleFiles = await resolveModuleFiles(stringArray(arguments.array("module_files")))
         let matrix = try await availabilityService.checkMatrix(
-            filePath: filePath,
+            filePath: resolvedPath,
             versions: versions,
             platform: try platformArgument(arguments),
-            moduleFiles: stringArray(arguments.array("module_files"))
+            moduleFiles: moduleFiles
         )
         return matrix.summary
     }
@@ -695,6 +733,19 @@ public final class MCPProtocolHandler {
         return strings.isEmpty ? nil : strings
     }
 
+    private func resolveModuleFiles(_ paths: [String]?) async -> [String]? {
+        guard let paths else {
+            return nil
+        }
+
+        var resolved: [String] = []
+        resolved.reserveCapacity(paths.count)
+        for path in paths {
+            resolved.append(await workspaceManager.resolvePath(path))
+        }
+        return resolved
+    }
+
     // MARK: - Resources
 
     private func handleResourcesList(_ request: MCPRequest) async throws -> MCPResponse {
@@ -721,13 +772,18 @@ public final class MCPProtocolHandler {
 
         switch uri {
         case "swift://workspace":
-            content = """
-                {
-                    "type": "swift_workspace",
-                    "capabilities": ["symbol_search", "references", "definitions", "hover", "formatting", "diagnostics"],
-                    "sourcekit_lsp": "available"
-                }
-                """
+            var payload: JSONObject = [
+                "type": "swift_workspace",
+                "capabilities": [
+                    "symbol_search", "references", "definitions", "hover", "formatting", "diagnostics",
+                ],
+                "sourcekit_lsp": "available",
+            ]
+            if let root = await workspaceManager.activeWorkspaceRoot() {
+                payload["workspace_root"] = .string(root.path)
+            }
+            let data = try JSONEncoder().encode(payload)
+            content = String(decoding: data, as: UTF8.self)
         default:
             throw MCPError.resourceNotFound(uri)
         }

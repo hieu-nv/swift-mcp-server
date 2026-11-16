@@ -8,6 +8,7 @@ import SourceKitLSP
 public actor WorkspaceSessionManager {
     private static let projectMarkers = [
         "Package.swift",
+        "buildServer.json",
         "compile_commands.json",
     ]
 
@@ -65,7 +66,7 @@ public actor WorkspaceSessionManager {
     /// Avoids spawning SourceKit-LSP on non-project directories (like `/` or `$HOME`).
     public func warmUpDefaultIfApplicable() async {
         if let pinnedServer {
-            try? await pinnedServer.initialize()
+            try? await pinnedServer.warmUp()
             return
         }
 
@@ -74,25 +75,29 @@ public actor WorkspaceSessionManager {
         }
 
         let server = server(forWorkspaceRoot: root)
-        try? await server.initialize()
+        try? await server.warmUp()
     }
 
     /// Updates the default workspace hint from MCP `initialize` parameters when
-    /// running without an explicit `--workspace` argument.
-    public func updateClientWorkspaceHint(from initializeParams: JSONObject?) {
+    /// running without an explicit `--workspace` argument. Returns `true` when
+    /// a usable workspace root was adopted.
+    @discardableResult
+    public func updateClientWorkspaceHint(from initializeParams: JSONObject?) -> Bool {
         guard pinnedServer == nil, let params = initializeParams else {
-            return
+            return false
         }
 
         let candidates = Self.workspaceCandidates(from: params)
         for candidate in candidates {
             let canonical = Self.canonicalDirectoryURL(candidate)
             if Self.isUsableWorkspaceRoot(canonical, excludedAncestors: excludedAncestors) {
+                let changed = defaultWorkspaceRoot != canonical
                 defaultWorkspaceRoot = canonical
                 logger.info("Updated default workspace from MCP client: \(canonical.path)")
-                return
+                return changed
             }
         }
+        return false
     }
 
     /// Resolves the `SwiftLanguageServer` and normalized file path for a file-scoped tool call.
@@ -151,6 +156,30 @@ public actor WorkspaceSessionManager {
     /// Resolves a potentially relative file path against the active or default workspace root.
     public func resolvePath(_ filePath: String) -> String {
         resolveFileURL(filePath).path
+    }
+
+    /// Returns an actionable note when the file's discovered workspace is an
+    /// Xcode project (`.xcodeproj` / `.xcworkspace`) without `Package.swift`,
+    /// `buildServer.json`, or `compile_commands.json`.
+    public func indexingLimitationNote(forFilePath filePath: String) -> String? {
+        let resolvedURL = resolveFileURL(filePath)
+        let root: URL
+        if let pinnedServer {
+            root = pinnedServer.workspaceURL
+        } else {
+            root = Self.discoverProjectRoot(
+                for: resolvedURL,
+                fallbackRoot: defaultWorkspaceRoot,
+                excludedAncestors: excludedAncestors
+            )
+        }
+
+        guard Self.isUnconfiguredXcodeWorkspace(at: root) else {
+            return nil
+        }
+
+        return
+            "Note: Workspace '\(root.lastPathComponent)' uses an Xcode project without buildServer.json; SourceKit-LSP can only report in-file occurrences until a BSP configuration (e.g. xcode-build-server) is generated."
     }
 
     /// Returns the currently active workspace root, if known.
@@ -297,7 +326,22 @@ public actor WorkspaceSessionManager {
             }
         }
 
-        let entries = (try? fileManager.contentsOfDirectory(atPath: directory.path)) ?? []
+        return containsXcodeProjectBundle(at: directory)
+    }
+
+    private static func isUnconfiguredXcodeWorkspace(at directory: URL) -> Bool {
+        let fileManager = FileManager.default
+        for marker in projectMarkers {
+            if fileManager.fileExists(atPath: directory.appendingPathComponent(marker).path) {
+                return false
+            }
+        }
+
+        return containsXcodeProjectBundle(at: directory)
+    }
+
+    private static func containsXcodeProjectBundle(at directory: URL) -> Bool {
+        let entries = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
         return entries.contains { entry in
             let ext = URL(fileURLWithPath: entry).pathExtension.lowercased()
             return xcodeProjectExtensions.contains(ext)

@@ -578,6 +578,7 @@ final class SwiftMCPServerTests: XCTestCase {
             currentDirectoryURL: FileManager.default.homeDirectoryForCurrentUser
         )
         let handler = MCPProtocolHandler(workspaceManager: manager, logger: logger)
+        defer { Task { await manager.shutdownAll() } }
 
         let initRequest = MCPRequest(
             jsonrpc: "2.0",
@@ -603,6 +604,496 @@ final class SwiftMCPServerTests: XCTestCase {
             canonicalPath(resolved),
             canonicalPath(package.appendingPathComponent("Sources/HintWorkspace/File.swift").path)
         )
+    }
+
+    func testSourceKitLSPClientSynchronizesIndexAndAcknowledgesServerRequests() async throws {
+        try XCTSkipUnless(FileManager.default.isExecutableFile(atPath: "/usr/bin/python3"))
+
+        let workspace = try makeTemporaryPackage(named: "FakeSyncWorkspace")
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
+        let sourceFile = workspace.appendingPathComponent("Sources/FakeSyncWorkspace/main.swift")
+        try "struct Demo {}\n\nlet d = Demo()\n".write(to: sourceFile, atomically: true, encoding: .utf8)
+
+        let fakeServer = workspace.appendingPathComponent("fake-lsp.py")
+        try """
+        #!/usr/bin/python3 -u
+        import json, sys
+
+        synchronized = False
+        server_request_acked = False
+
+        def send(msg):
+            body = json.dumps(msg).encode("utf-8")
+            sys.stdout.buffer.write(f"Content-Length: {len(body)}\\r\\n\\r\\n".encode("utf-8") + body)
+            sys.stdout.buffer.flush()
+
+        def read_msg():
+            headers = b""
+            while b"\\r\\n\\r\\n" not in headers:
+                ch = sys.stdin.buffer.read(1)
+                if not ch:
+                    return None
+                headers += ch
+            length = 0
+            for line in headers.decode("utf-8").split("\\r\\n"):
+                if line.lower().startswith("content-length:"):
+                    length = int(line.split(":", 1)[1].strip())
+            body = sys.stdin.buffer.read(length)
+            return json.loads(body.decode("utf-8"))
+
+        while True:
+            msg = read_msg()
+            if msg is None:
+                break
+            if "method" not in msg and msg.get("id") == "srv-progress-1":
+                server_request_acked = True
+                continue
+            method = msg.get("method")
+            rid = msg.get("id")
+            if method == "initialize":
+                send({"jsonrpc": "2.0", "id": rid, "result": {"capabilities": {"referencesProvider": True}}})
+                send({"jsonrpc": "2.0", "id": "srv-progress-1", "method": "window/workDoneProgress/create", "params": {"token": "idx"}})
+            elif method == "workspace/synchronize":
+                if msg.get("params", {}).get("index") is True:
+                    synchronized = True
+                send({"jsonrpc": "2.0", "id": rid, "result": {}})
+            elif method == "textDocument/documentHighlight":
+                send({"jsonrpc": "2.0", "id": rid, "result": []})
+            elif method == "textDocument/references":
+                uri = msg["params"]["textDocument"]["uri"]
+                if synchronized and server_request_acked:
+                    send({"jsonrpc": "2.0", "id": rid, "result": [
+                        {"uri": uri, "range": {"start": {"line": 0, "character": 7}, "end": {"line": 0, "character": 11}}},
+                        {"uri": uri, "range": {"start": {"line": 2, "character": 8}, "end": {"line": 2, "character": 12}}},
+                    ]})
+                else:
+                    send({"jsonrpc": "2.0", "id": rid, "result": [
+                        {"uri": uri, "range": {"start": {"line": 999, "character": 0}, "end": {"line": 999, "character": 1}}}
+                    ]})
+            elif method == "shutdown":
+                send({"jsonrpc": "2.0", "id": rid, "result": None})
+            elif method == "exit":
+                break
+        """
+        .write(to: fakeServer, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeServer.path)
+
+        let client = SourceKitLSPClient(
+            executablePath: fakeServer.path,
+            workspaceRoot: workspace,
+            logger: Logger(label: "test")
+        )
+        defer { Task { await client.shutdown() } }
+
+        let locations = try await client.references(
+            fileURL: sourceFile,
+            position: LSPPosition(line: 0, character: 7)
+        )
+        XCTAssertEqual(locations.map(\.range.start.line), [0, 2])
+    }
+
+    func testSourceKitLSPClientFallsBackToPollWhenSynchronizeUnsupported() async throws {
+        try XCTSkipUnless(FileManager.default.isExecutableFile(atPath: "/usr/bin/python3"))
+
+        let workspace = try makeTemporaryPackage(named: "FakeFallbackWorkspace")
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
+        let sourceFile = workspace.appendingPathComponent("Sources/FakeFallbackWorkspace/main.swift")
+        try "struct Legacy {}\n".write(to: sourceFile, atomically: true, encoding: .utf8)
+
+        let fakeServer = workspace.appendingPathComponent("fake-legacy-lsp.py")
+        try """
+        #!/usr/bin/python3 -u
+        import json, sys
+
+        ref_calls = 0
+
+        def send(msg):
+            body = json.dumps(msg).encode("utf-8")
+            sys.stdout.buffer.write(f"Content-Length: {len(body)}\\r\\n\\r\\n".encode("utf-8") + body)
+            sys.stdout.buffer.flush()
+
+        def read_msg():
+            headers = b""
+            while b"\\r\\n\\r\\n" not in headers:
+                ch = sys.stdin.buffer.read(1)
+                if not ch:
+                    return None
+                headers += ch
+            length = 0
+            for line in headers.decode("utf-8").split("\\r\\n"):
+                if line.lower().startswith("content-length:"):
+                    length = int(line.split(":", 1)[1].strip())
+            body = sys.stdin.buffer.read(length)
+            return json.loads(body.decode("utf-8"))
+
+        while True:
+            msg = read_msg()
+            if msg is None:
+                break
+            method = msg.get("method")
+            rid = msg.get("id")
+            if method == "initialize":
+                send({"jsonrpc": "2.0", "id": rid, "result": {"capabilities": {"referencesProvider": True}}})
+            elif method == "workspace/synchronize":
+                send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "Method not found"}})
+            elif method == "textDocument/documentHighlight":
+                send({"jsonrpc": "2.0", "id": rid, "result": []})
+            elif method == "textDocument/references":
+                ref_calls += 1
+                uri = msg["params"]["textDocument"]["uri"]
+                if ref_calls >= 2:
+                    send({"jsonrpc": "2.0", "id": rid, "result": [
+                        {"uri": uri, "range": {"start": {"line": 0, "character": 7}, "end": {"line": 0, "character": 13}}}
+                    ]})
+                else:
+                    send({"jsonrpc": "2.0", "id": rid, "result": []})
+            elif method == "shutdown":
+                send({"jsonrpc": "2.0", "id": rid, "result": None})
+            elif method == "exit":
+                break
+        """
+        .write(to: fakeServer, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeServer.path)
+
+        let client = SourceKitLSPClient(
+            executablePath: fakeServer.path,
+            workspaceRoot: workspace,
+            logger: Logger(label: "test")
+        )
+        defer { Task { await client.shutdown() } }
+
+        let locations = try await client.references(
+            fileURL: sourceFile,
+            position: LSPPosition(line: 0, character: 7)
+        )
+        XCTAssertEqual(locations.map(\.range.start.line), [0])
+    }
+
+    func testSourceKitLSPClientCancelsTimedOutSynchronizeAndProceedsBestEffort() async throws {
+        try XCTSkipUnless(FileManager.default.isExecutableFile(atPath: "/usr/bin/python3"))
+
+        let workspace = try makeTemporaryPackage(named: "FakeTimeoutWorkspace")
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
+        let sourceFile = workspace.appendingPathComponent("Sources/FakeTimeoutWorkspace/main.swift")
+        try "struct Slow {}\n".write(to: sourceFile, atomically: true, encoding: .utf8)
+
+        let fakeServer = workspace.appendingPathComponent("fake-timeout-lsp.py")
+        try """
+        #!/usr/bin/python3 -u
+        import json, sys
+
+        sync_id = None
+        cancel_seen = False
+
+        def send(msg):
+            body = json.dumps(msg).encode("utf-8")
+            sys.stdout.buffer.write(f"Content-Length: {len(body)}\\r\\n\\r\\n".encode("utf-8") + body)
+            sys.stdout.buffer.flush()
+
+        def read_msg():
+            headers = b""
+            while b"\\r\\n\\r\\n" not in headers:
+                ch = sys.stdin.buffer.read(1)
+                if not ch:
+                    return None
+                headers += ch
+            length = 0
+            for line in headers.decode("utf-8").split("\\r\\n"):
+                if line.lower().startswith("content-length:"):
+                    length = int(line.split(":", 1)[1].strip())
+            body = sys.stdin.buffer.read(length)
+            return json.loads(body.decode("utf-8"))
+
+        while True:
+            msg = read_msg()
+            if msg is None:
+                break
+            method = msg.get("method")
+            rid = msg.get("id")
+            if method == "initialize":
+                send({"jsonrpc": "2.0", "id": rid, "result": {"capabilities": {"referencesProvider": True}}})
+            elif method == "workspace/synchronize":
+                sync_id = rid
+                # Intentionally do not reply so client times out and cancels.
+            elif method == "$/cancelRequest":
+                if msg.get("params", {}).get("id") == sync_id:
+                    cancel_seen = True
+            elif method == "textDocument/documentHighlight":
+                send({"jsonrpc": "2.0", "id": rid, "result": []})
+            elif method == "textDocument/references":
+                uri = msg["params"]["textDocument"]["uri"]
+                if cancel_seen:
+                    send({"jsonrpc": "2.0", "id": rid, "result": [
+                        {"uri": uri, "range": {"start": {"line": 0, "character": 7}, "end": {"line": 0, "character": 11}}}
+                    ]})
+                else:
+                    send({"jsonrpc": "2.0", "id": rid, "result": []})
+            elif method == "shutdown":
+                send({"jsonrpc": "2.0", "id": rid, "result": None})
+            elif method == "exit":
+                break
+        """
+        .write(to: fakeServer, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeServer.path)
+
+        let client = SourceKitLSPClient(
+            executablePath: fakeServer.path,
+            workspaceRoot: workspace,
+            logger: Logger(label: "test"),
+            indexSynchronizeTimeout: 0.25
+        )
+        defer { Task { await client.shutdown() } }
+
+        let locations = try await client.references(
+            fileURL: sourceFile,
+            position: LSPPosition(line: 0, character: 7)
+        )
+        XCTAssertEqual(locations.map(\.range.start.line), [0])
+    }
+
+    func testFindReferencesSynchronizesAllTargetsAndReturnsEmptyQuicklyOnNonSymbol() async throws {
+        try XCTSkipUnless(sourceKitLSPAvailable())
+
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
+        let coreDir = workspace.appendingPathComponent("Sources/CoreLib", isDirectory: true)
+        let appDir = workspace.appendingPathComponent("Sources/App", isDirectory: true)
+        let testDir = workspace.appendingPathComponent("Tests/CoreTests", isDirectory: true)
+        try FileManager.default.createDirectory(at: coreDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: appDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: testDir, withIntermediateDirectories: true)
+
+        try """
+        // swift-tools-version: 5.9
+        import PackageDescription
+
+        let package = Package(
+            name: "MultiTargetPkg",
+            targets: [
+                .target(name: "CoreLib"),
+                .executableTarget(name: "App", dependencies: ["CoreLib"]),
+                .testTarget(name: "CoreTests", dependencies: ["CoreLib"]),
+            ]
+        )
+        """
+        .write(to: workspace.appendingPathComponent("Package.swift"), atomically: true, encoding: .utf8)
+
+        let coreFile = coreDir.appendingPathComponent("Core.swift")
+        let appFile = appDir.appendingPathComponent("main.swift")
+        let testFile = testDir.appendingPathComponent("CoreTests.swift")
+
+        try """
+        public struct CoreAPI {
+            public init() {}
+            public func ping() -> Int { 1 }
+        }
+        """
+        .write(to: coreFile, atomically: true, encoding: .utf8)
+
+        try """
+        import CoreLib
+        print(CoreAPI().ping())
+        """
+        .write(to: appFile, atomically: true, encoding: .utf8)
+
+        try """
+        import XCTest
+        @testable import CoreLib
+        final class CoreTests: XCTestCase {
+            func testPing() { XCTAssertEqual(CoreAPI().ping(), 1) }
+        }
+        """
+        .write(to: testFile, atomically: true, encoding: .utf8)
+
+        let server = SwiftLanguageServer(logger: Logger(label: "test"), workspaceRoot: workspace)
+        defer { Task { await server.shutdown() } }
+
+        let references = try await server.findReferences(
+            at: Position(line: 2, character: 16),
+            in: coreFile.path
+        )
+        let referencedFiles = Set(references.compactMap { canonicalPath(URL(string: $0.uri)?.path) })
+        XCTAssertEqual(
+            referencedFiles,
+            [
+                canonicalPath(coreFile.path),
+                canonicalPath(appFile.path),
+                canonicalPath(testFile.path),
+            ]
+        )
+
+        let emptyStart = Date()
+        let keywordReferences = try await server.findReferences(
+            at: Position(line: 0, character: 0),
+            in: coreFile.path
+        )
+        let elapsed = Date().timeIntervalSince(emptyStart)
+        XCTAssertTrue(keywordReferences.isEmpty)
+        XCTAssertLessThan(elapsed, 5.0, "Non-symbol empty lookup should not stall for 20s poll timeout")
+    }
+
+    func testFindReferencesCoversLocalAndParameterSymbols() async throws {
+        try XCTSkipUnless(sourceKitLSPAvailable())
+
+        let workspace = try makeTemporaryPackage(named: "LocalSymbolsPkg")
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
+        let sourceFile = workspace.appendingPathComponent("Sources/LocalSymbolsPkg/main.swift")
+        try """
+        import Foundation
+
+        struct Formatter {
+            func format(prefix: String, rawValue: String) -> String {
+                func trim(_ input: String) -> String {
+                    input.trimmingCharacters(in: .whitespaces)
+                }
+                let cleaned = trim(rawValue)
+                return "\\(prefix): \\(cleaned)"
+            }
+        }
+
+        print(Formatter().format(prefix: "ID", rawValue: " 42 "))
+        """
+        .write(to: sourceFile, atomically: true, encoding: .utf8)
+
+        let server = SwiftLanguageServer(logger: Logger(label: "test"), workspaceRoot: workspace)
+        defer { Task { await server.shutdown() } }
+
+        let localRefs = try await server.findReferences(
+            at: Position(line: 7, character: 12),
+            in: sourceFile.path
+        )
+        XCTAssertEqual(localRefs.map(\.line), [7, 8])
+
+        let nestedFuncRefs = try await server.findReferences(
+            at: Position(line: 4, character: 13),
+            in: sourceFile.path
+        )
+        XCTAssertEqual(nestedFuncRefs.map(\.line), [4, 7])
+
+        let paramRefs = try await server.findReferences(
+            at: Position(line: 7, character: 27),
+            in: sourceFile.path
+        )
+        XCTAssertEqual(paramRefs.map(\.line), [3, 7])
+
+        let typeRefs = try await server.findReferences(
+            at: Position(line: 2, character: 7),
+            in: sourceFile.path
+        )
+        XCTAssertEqual(typeRefs.map(\.line), [2, 12])
+    }
+
+    func testWorkspaceManagerDiscoversBuildServerJSONRoot() async throws {
+        let outerRepo = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: outerRepo) }
+
+        let gitDir = outerRepo.appendingPathComponent(".git", isDirectory: true)
+        let bspAppDir = outerRepo.appendingPathComponent("ios-app", isDirectory: true)
+        let sourcesDir = bspAppDir.appendingPathComponent("Sources", isDirectory: true)
+        try FileManager.default.createDirectory(at: gitDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: sourcesDir, withIntermediateDirectories: true)
+        try "{}\n".write(
+            to: bspAppDir.appendingPathComponent("buildServer.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let viewFile = sourcesDir.appendingPathComponent("View.swift")
+        try "struct View {}\n".write(to: viewFile, atomically: true, encoding: .utf8)
+
+        let manager = WorkspaceSessionManager(
+            logger: Logger(label: "test"),
+            currentDirectoryURL: FileManager.default.homeDirectoryForCurrentUser
+        )
+        defer { Task { await manager.shutdownAll() } }
+
+        let (server, _) = await manager.server(forFilePath: viewFile.path)
+        XCTAssertEqual(canonicalPath(server.workspaceURL.path), canonicalPath(bspAppDir.path))
+    }
+
+    func testFindReferencesInXcodeProjectWithoutBuildServerReportsBSPNoteAndInFileHits() async throws {
+        try XCTSkipUnless(sourceKitLSPAvailable())
+
+        let projectRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: projectRoot) }
+
+        let xcodeproj = projectRoot.appendingPathComponent("SampleXcodeApp.xcodeproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: xcodeproj, withIntermediateDirectories: true)
+        try "// !$*UTF8*$!\n{ archiveVersion = 1; classes = {}; objectVersion = 56; objects = {}; rootObject = AA; }\n"
+            .write(to: xcodeproj.appendingPathComponent("project.pbxproj"), atomically: true, encoding: .utf8)
+
+        let helperFile = projectRoot.appendingPathComponent("Helper.swift")
+        try "struct Helper {}\nlet localHelper = Helper()\n"
+            .write(to: helperFile, atomically: true, encoding: .utf8)
+
+        let manager = WorkspaceSessionManager(
+            logger: Logger(label: "test"),
+            currentDirectoryURL: FileManager.default.homeDirectoryForCurrentUser
+        )
+        let handler = MCPProtocolHandler(workspaceManager: manager, logger: Logger(label: "test"))
+        defer { Task { await manager.shutdownAll() } }
+
+        let hitRequest = MCPRequest(
+            jsonrpc: "2.0",
+            id: .string("xcode-hit"),
+            method: "tools/call",
+            params: [
+                "name": "find_references",
+                "arguments": [
+                    "file_path": .string(helperFile.path),
+                    "line": 0,
+                    "character": 7,
+                ],
+            ]
+        )
+        let hitResponse = try await handler.handleRequest(hitRequest)
+        let hitText = try XCTUnwrap(
+            hitResponse.result?.objectValue?.array("content")?.first?.objectValue?.string("text")
+        )
+        XCTAssertTrue(hitText.contains(":0:7"), hitText)
+        XCTAssertTrue(hitText.contains(":1:18"), hitText)
+        XCTAssertTrue(hitText.contains("buildServer.json"), hitText)
+
+        let emptyRequest = MCPRequest(
+            jsonrpc: "2.0",
+            id: .string("xcode-empty"),
+            method: "tools/call",
+            params: [
+                "name": "find_references",
+                "arguments": [
+                    "file_path": .string(helperFile.path),
+                    "line": 0,
+                    "character": 0,
+                ],
+            ]
+        )
+        let emptyResponse = try await handler.handleRequest(emptyRequest)
+        let emptyText = try XCTUnwrap(
+            emptyResponse.result?.objectValue?.array("content")?.first?.objectValue?.string("text")
+        )
+        XCTAssertTrue(emptyText.hasPrefix("No results."), emptyText)
+        XCTAssertTrue(emptyText.contains("buildServer.json"), emptyText)
+
+        // Once buildServer.json is added, no Xcode BSP warning note should be emitted.
+        try "{}\n".write(
+            to: projectRoot.appendingPathComponent("buildServer.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let configuredNote = await manager.indexingLimitationNote(forFilePath: helperFile.path)
+        XCTAssertNil(configuredNote)
+        let configuredEmptyResponse = try await handler.handleRequest(emptyRequest)
+        let configuredEmptyText = try XCTUnwrap(
+            configuredEmptyResponse.result?.objectValue?.array("content")?.first?.objectValue?.string("text")
+        )
+        XCTAssertEqual(configuredEmptyText, "No results.")
     }
 
     // MARK: - Helpers

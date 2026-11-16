@@ -153,6 +153,11 @@ public final class SwiftLanguageServer {
         try await sourceKitLSPClient.start()
     }
 
+    /// Start the SourceKit-LSP session and wait for initial index synchronization.
+    public func warmUp() async throws {
+        try await sourceKitLSPClient.synchronizeIndex()
+    }
+
     // MARK: - Symbol Operations for MCP
 
     public func findSymbols(in filePath: String, namePattern: String) async throws -> [SymbolInfo] {
@@ -322,15 +327,16 @@ public final class SwiftLanguageServer {
     // MARK: - Helpers
 
     private func resolveFileURL(_ filePath: String) -> URL {
+        let resolved: URL
         if let url = URL(string: filePath), url.isFileURL {
-            return url.standardizedFileURL
+            resolved = url
+        } else if filePath.hasPrefix("/") {
+            resolved = URL(fileURLWithPath: filePath)
+        } else {
+            resolved = workspaceRoot.appendingPathComponent(filePath)
         }
 
-        if filePath.hasPrefix("/") {
-            return URL(fileURLWithPath: filePath).standardizedFileURL
-        }
-
-        return workspaceRoot.appendingPathComponent(filePath).standardizedFileURL
+        return resolved.resolvingSymlinksInPath().standardizedFileURL
     }
 
     private func withInitialized<T>(_ operation: () async throws -> T) async throws -> T {

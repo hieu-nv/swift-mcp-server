@@ -14,6 +14,8 @@ actor SourceKitLSPClient {
     /// Upper bound for waiting on index-backed requests (workspace symbols,
     /// rename, call/type hierarchy) while background indexing completes.
     private let indexReadinessTimeout: TimeInterval = 20
+    /// Upper bound for `workspace/synchronize` (`{"index": true}`) on cold packages.
+    private let indexSynchronizeTimeout: TimeInterval
 
     private let executablePath: String
     private let workspaceRoot: URL
@@ -30,6 +32,7 @@ actor SourceKitLSPClient {
     private var nextRequestID = 1
     private var isStarted = false
     private var isShuttingDown = false
+    private var supportsWorkspaceSynchronize = true
     private var openDocuments: [String: OpenDocumentState] = [:]
     private var latestDiagnostics: [String: [LSPDiagnostic]] = [:]
     // Raw diagnostic payloads kept verbatim so they can be replayed into a
@@ -41,10 +44,28 @@ actor SourceKitLSPClient {
     // and resumed without disturbing other waiters on the same document.
     private var diagnosticWaiters: [String: [UUID: CheckedContinuation<[LSPDiagnostic], Error>]] = [:]
 
-    init(executablePath: String, workspaceRoot: URL, logger: Logger) {
+    init(
+        executablePath: String,
+        workspaceRoot: URL,
+        logger: Logger,
+        indexSynchronizeTimeout: TimeInterval? = nil
+    ) {
         self.executablePath = executablePath
         self.workspaceRoot = workspaceRoot.standardizedFileURL
         self.logger = logger
+        self.indexSynchronizeTimeout = indexSynchronizeTimeout ?? Self.configuredIndexSynchronizeTimeout()
+    }
+
+    static func configuredIndexSynchronizeTimeout(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> TimeInterval {
+        if let raw = environment["SWIFT_MCP_INDEX_TIMEOUT"],
+            let seconds = TimeInterval(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+            seconds > 0
+        {
+            return seconds
+        }
+        return 60
     }
 
     /// Start the session, coalescing concurrent callers onto a single start
@@ -146,6 +167,15 @@ actor SourceKitLSPClient {
                     "definition": [
                         "linkSupport": true
                     ],
+                    "references": [
+                        "dynamicRegistration": false
+                    ],
+                    "documentHighlight": [
+                        "dynamicRegistration": false
+                    ],
+                    "implementation": [
+                        "dynamicRegistration": false
+                    ],
                     "formatting": [:],
                     "hover": [
                         "contentFormat": ["markdown", "plaintext"]
@@ -208,29 +238,137 @@ actor SourceKitLSPClient {
         }
     }
 
+    /// Wait for SourceKit-LSP's background indexer to catch up when supported.
+    /// Returns `true` when `workspace/synchronize` is supported (completing or
+    /// timing out best-effort), or `false` when an older toolchain rejects the
+    /// method so callers can fall back to `poll`.
+    @discardableResult
+    func synchronizeIndex() async throws -> Bool {
+        try await start()
+        guard supportsWorkspaceSynchronize else {
+            return false
+        }
+
+        do {
+            _ = try await sendRequest(
+                method: "workspace/synchronize",
+                params: ["index": .bool(true)],
+                timeout: indexSynchronizeTimeout
+            )
+            return true
+        } catch let error as SourceKitLSPClientError {
+            switch error {
+            case .responseError(let code, _) where code == -32601 || code == -32602:
+                logger.debug(
+                    "SourceKit-LSP does not support workspace/synchronize (code \(code)); falling back to polling"
+                )
+                supportsWorkspaceSynchronize = false
+                return false
+            case .requestTimedOut:
+                logger.warning("Timed out waiting for SourceKit-LSP index synchronization; proceeding best-effort")
+                return true
+            case .responseError(let code, _) where Self.transientResponseErrorCodes.contains(code):
+                logger.debug("Transient error during workspace/synchronize (code \(code)); proceeding best-effort")
+                return true
+            default:
+                throw error
+            }
+        }
+    }
+
     func references(fileURL: URL, position: LSPPosition, includeDeclaration: Bool = true) async throws -> [LSPLocation]
     {
         let document = try await prepareDocument(fileURL)
-
-        return try await poll(
-            timeout: indexReadinessTimeout,
-            operation: {
-                try await self.requestDecodedArray(
-                    method: "textDocument/references",
-                    params: self.textDocumentPositionParams(
-                        uri: document.uri,
-                        position: position,
-                        additional: [
-                            "context": [
-                                "includeDeclaration": .bool(includeDeclaration)
-                            ]
-                        ]
-                    ),
-                    errorMessage: "Invalid references payload from SourceKit-LSP"
-                )
-            },
-            until: { !$0.isEmpty }
+        let params = textDocumentPositionParams(
+            uri: document.uri,
+            position: position,
+            additional: [
+                "context": [
+                    "includeDeclaration": .bool(includeDeclaration)
+                ]
+            ]
         )
+
+        let indexLocations: [LSPLocation]
+        if try await synchronizeIndex() {
+            indexLocations = try await requestDecodedArray(
+                method: "textDocument/references",
+                params: params,
+                errorMessage: "Invalid references payload from SourceKit-LSP"
+            )
+        } else {
+            indexLocations = try await poll(
+                timeout: indexReadinessTimeout,
+                operation: {
+                    try await self.requestDecodedArray(
+                        method: "textDocument/references",
+                        params: params,
+                        errorMessage: "Invalid references payload from SourceKit-LSP"
+                    )
+                },
+                until: { !$0.isEmpty }
+            )
+        }
+
+        // SourceKit-LSP's `textDocument/references` only queries the indexstore,
+        // omitting local variables, nested functions, and parameter body uses.
+        // Merge open-document AST highlights when declarations are included (or
+        // as a fallback when the index returned nothing).
+        guard includeDeclaration || indexLocations.isEmpty else {
+            return Self.dedupeAndSortLocations(indexLocations)
+        }
+
+        let highlightLocations = await documentHighlightLocations(uri: document.uri, position: position)
+        return Self.dedupeAndSortLocations(indexLocations + highlightLocations)
+    }
+
+    private func documentHighlightLocations(uri: String, position: LSPPosition) async -> [LSPLocation] {
+        do {
+            let highlights: [LSPDocumentHighlight] = try await requestDecodedArray(
+                method: "textDocument/documentHighlight",
+                params: textDocumentPositionParams(uri: uri, position: position),
+                errorMessage: "Invalid documentHighlight payload from SourceKit-LSP"
+            )
+            return highlights.map { LSPLocation(uri: uri, range: $0.range) }
+        } catch {
+            logger.debug("textDocument/documentHighlight unavailable: \(error.localizedDescription)")
+            return []
+        }
+    }
+
+    private static func dedupeAndSortLocations(_ locations: [LSPLocation]) -> [LSPLocation] {
+        var seen = Set<String>()
+        var unique: [(sortKey: String, location: LSPLocation)] = []
+        unique.reserveCapacity(locations.count)
+
+        for location in locations {
+            let (canonicalURI, sortPath) = canonicalizedFileURI(location.uri)
+            let dedupeKey = "\(sortPath):\(location.range.start.line):\(location.range.start.character)"
+            guard seen.insert(dedupeKey).inserted else {
+                continue
+            }
+            unique.append((sortPath, LSPLocation(uri: canonicalURI, range: location.range)))
+        }
+
+        unique.sort { lhs, rhs in
+            if lhs.sortKey != rhs.sortKey {
+                return lhs.sortKey < rhs.sortKey
+            }
+            if lhs.location.range.start.line != rhs.location.range.start.line {
+                return lhs.location.range.start.line < rhs.location.range.start.line
+            }
+            return lhs.location.range.start.character < rhs.location.range.start.character
+        }
+
+        return unique.map(\.location)
+    }
+
+    private static func canonicalizedFileURI(_ uri: String) -> (uri: String, sortKey: String) {
+        guard let url = URL(string: uri), url.isFileURL else {
+            return (uri, uri)
+        }
+        let canonical = url.resolvingSymlinksInPath().standardizedFileURL
+        return (canonical.absoluteString, canonical.path)
     }
 
     func definition(fileURL: URL, position: LSPPosition) async throws -> [LSPLocationLink] {
@@ -484,6 +622,7 @@ actor SourceKitLSPClient {
         standardError = nil
         stdoutBuffer.removeAll()
         isStarted = false
+        supportsWorkspaceSynchronize = true
         openDocuments.removeAll()
         latestDiagnostics.removeAll()
         failAllPendingRequests(with: SwiftMCPError.communicationError("SourceKit-LSP shutdown"))
@@ -594,9 +733,9 @@ actor SourceKitLSPClient {
     private func prepareDocument(_ fileURL: URL) async throws -> PreparedDocument {
         try await start()
 
-        let standardizedURL = fileURL.standardizedFileURL
-        _ = try await syncDocument(standardizedURL)
-        return PreparedDocument(uri: standardizedURL.absoluteString)
+        let canonicalURL = fileURL.resolvingSymlinksInPath().standardizedFileURL
+        _ = try await syncDocument(canonicalURL)
+        return PreparedDocument(uri: canonicalURL.absoluteString)
     }
 
     private func poll<T>(
@@ -829,7 +968,11 @@ actor SourceKitLSPClient {
 
     // MARK: - Requests
 
-    private func sendRequest(method: String, params: JSONObject?) async throws -> JSONValue {
+    private func sendRequest(
+        method: String,
+        params: JSONObject?,
+        timeout: TimeInterval? = nil
+    ) async throws -> JSONValue {
         let requestID = nextRequestID
         nextRequestID += 1
 
@@ -839,6 +982,18 @@ actor SourceKitLSPClient {
             "method": .string(method),
             "params": .object(params ?? [:]),
         ]
+
+        let timeoutTask: Task<Void, Never>?
+        if let timeout {
+            timeoutTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                await self?.timeOutPendingRequest(id: requestID, method: method)
+            }
+        } else {
+            timeoutTask = nil
+        }
+        defer { timeoutTask?.cancel() }
 
         return try await withCheckedThrowingContinuation { continuation in
             pendingRequests[requestID] = continuation
@@ -850,6 +1005,15 @@ actor SourceKitLSPClient {
                 continuation.resume(throwing: error)
             }
         }
+    }
+
+    private func timeOutPendingRequest(id: Int, method: String) {
+        guard let continuation = pendingRequests.removeValue(forKey: id) else {
+            return
+        }
+
+        try? sendNotification(method: "$/cancelRequest", params: ["id": .integer(id)])
+        continuation.resume(throwing: SourceKitLSPClientError.requestTimedOut(method: method))
     }
 
     private func sendNotification(method: String, params: JSONObject?) throws {
@@ -914,6 +1078,7 @@ actor SourceKitLSPClient {
         standardError = nil
         isStarted = false
         isShuttingDown = false
+        supportsWorkspaceSynchronize = true
     }
 
     private func consumeMessages() {
@@ -980,6 +1145,14 @@ actor SourceKitLSPClient {
 
     private func handleMessage(_ message: JSONObject) {
         if let method = message.string("method") {
+            if let requestID = message["id"] {
+                let response: JSONObject = [
+                    "jsonrpc": "2.0",
+                    "id": requestID,
+                    "result": .null,
+                ]
+                try? writeMessage(response)
+            }
             handleNotification(method: method, params: message.object("params") ?? [:])
             return
         }
@@ -1057,11 +1230,14 @@ actor SourceKitLSPClient {
 
 private enum SourceKitLSPClientError: Error, LocalizedError {
     case responseError(code: Int, message: String)
+    case requestTimedOut(method: String)
 
     var errorDescription: String? {
         switch self {
         case .responseError(let code, let message):
             return "SourceKit-LSP error \(code): \(message)"
+        case .requestTimedOut(let method):
+            return "Timed out waiting for SourceKit-LSP response to \(method)"
         }
     }
 }
@@ -1226,6 +1402,22 @@ struct LSPDocumentSymbol: LSPJSONDecodable {
         )
 
         return [symbol] + children.flatMap { $0.flattened(uri: uri, containerName: name) }
+    }
+}
+
+struct LSPDocumentHighlight: LSPJSONDecodable {
+    let range: LSPRange
+    let kind: Int?
+
+    init(jsonValue: JSONValue) throws {
+        guard let object = jsonValue.objectValue,
+            let rangeValue = object["range"]
+        else {
+            throw SwiftMCPError.communicationError("Invalid documentHighlight payload from SourceKit-LSP")
+        }
+
+        self.range = try LSPRange(jsonValue: rangeValue)
+        self.kind = object.int("kind")
     }
 }
 

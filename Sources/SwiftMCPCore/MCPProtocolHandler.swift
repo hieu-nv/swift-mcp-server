@@ -52,7 +52,12 @@ public final class MCPProtocolHandler {
     // MARK: - Initialize
 
     private func handleInitialize(_ request: MCPRequest) async throws -> MCPResponse {
-        await workspaceManager.updateClientWorkspaceHint(from: request.params)
+        if await workspaceManager.updateClientWorkspaceHint(from: request.params) {
+            let manager = workspaceManager
+            Task {
+                await manager.warmUpDefaultIfApplicable()
+            }
+        }
 
         let capabilities = ServerCapabilities(
             tools: ToolsCapability(listChanged: true),
@@ -449,7 +454,7 @@ public final class MCPProtocolHandler {
         return try await swiftLanguageServer.findSymbols(in: resolvedPath, namePattern: namePattern)
     }
 
-    private func handleFindReferences(_ arguments: JSONObject) async throws -> [String] {
+    private func handleFindReferences(_ arguments: JSONObject) async throws -> String {
         guard let filePath = arguments.string("file_path"),
             let line = arguments.int("line"),
             let character = arguments.int("character")
@@ -460,8 +465,20 @@ public final class MCPProtocolHandler {
         let (swiftLanguageServer, resolvedPath) = await workspaceManager.server(forFilePath: filePath)
         let position = Position(line: line, character: character)
         let locations = try await swiftLanguageServer.findReferences(at: position, in: resolvedPath)
+        let lines = locations.map { "\($0.uri):\($0.line):\($0.character)" }
+        let limitationNote = await workspaceManager.indexingLimitationNote(forFilePath: filePath)
 
-        return locations.map { "\($0.uri):\($0.line):\($0.character)" }
+        if lines.isEmpty {
+            if let limitationNote {
+                return "No results.\n\(limitationNote)"
+            }
+            return "No results."
+        }
+
+        if let limitationNote {
+            return (lines + [limitationNote]).joined(separator: "\n")
+        }
+        return lines.joined(separator: "\n")
     }
 
     private func handleGetDefinition(_ arguments: JSONObject) async throws -> [String] {
